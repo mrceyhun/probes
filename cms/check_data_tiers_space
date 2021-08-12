@@ -25,6 +25,9 @@ import traceback
 import os
 os.system('pip install pandas')
 import pandas as pd
+
+from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
+from rucio.common.config import config_get
 from rucio.core.lock import get_dataset_locks_by_rse_id
 from rucio.core import monitor
 from rucio.core.rse import list_rses, get_rse_usage, list_rse_attributes
@@ -34,8 +37,15 @@ from rucio.db.sqla.session import get_session
 # Exit statuses
 OK, WARNING, CRITICAL, UNKNOWN = 0, 1, 2, 3
 
+PROM_SERVERS = config_get('monitor', 'prometheus_servers', raise_exception=False, default='')
+if PROM_SERVERS != '':
+    PROM_SERVERS = PROM_SERVERS.split(',')
+
 if __name__ == '__main__':
     try:
+        registry = CollectorRegistry()
+        data_tier_used_space = Gauge('judge_data_tier_used_space',
+                                 '', labelnames=('country', 'rse', 'rse_type', 'data_tier', 'account'), registry=registry)
         session = get_session()
         for rse in list_rses():
             sources = get_rse_usage(rse['id'])
@@ -48,11 +58,13 @@ if __name__ == '__main__':
             df["tier"] = df.name.str.split("/", expand=True)[3].str.split("#", expand=True)[0]
             summ = df.groupby(["account", "tier"]).sum()
             summ = summ.sort_values("bytes", ascending=False)
-            for account, new_df in df.groupby(level=0):
-                print(new_df)
-                for tier in new_df[]:
-                    print(tier_df)
-                    bytes = tier_df[['tier']]['bytes']
+            for account, new_df in summ.groupby(level=0):
+                #print('ACCOUNT: '+ str(account))
+                for tier, data in new_df.groupby(level=1):
+                    #print(tier, account)
+                    bytes = data.loc[(account, tier), 'bytes']
+                    data_tier_used_space.labels(**{'country': country, 'rse': rse['rse'], 'rse_type': 'rse_type',
+                                                   'data_tier': tier, 'account': account}).set(bytes)
                     print(country, rse['rse'], rse_type, tier, account, bytes)
     except:
         print (traceback.format_exc())
