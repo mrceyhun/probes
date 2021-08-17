@@ -24,7 +24,11 @@ import sys
 import traceback
 import os
 os.system('pip install pandas')
+
+# Used for testing purposes. This line is not supposed to go in production since pandas will be installed
+# using docker image.
 import pandas as pd
+import multiprocessing as mp
 
 from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
 from rucio.common.config import config_get
@@ -41,31 +45,36 @@ PROM_SERVERS = config_get('monitor', 'prometheus_servers', raise_exception=False
 if PROM_SERVERS != '':
     PROM_SERVERS = PROM_SERVERS.split(',')
 
+def get_data_tiers_usage(rse):
+    sources = get_rse_usage(rse['id'])
+    attributes = list_rse_attributes(rse['id'])
+    country = attributes.get('country', 'UNKNOWN')
+    rse_type = session.query(models.RSE.rse_type).filter(models.RSE.id == rse['id']).scalar()
+    rse_type = str(rse_type).split('.', 1)[1]
+    meta = get_dataset_locks_by_rse_id(rse['id'])
+    df = pd.DataFrame(meta)
+    df["tier"] = df.name.str.split("/", expand=True)[3].str.split("#", expand=True)[0]
+    summ = df.groupby(["account", "tier"]).sum()
+    summ = summ.sort_values("bytes", ascending=False)
+
+    for account, new_df in summ.groupby(level=0):
+        for tier, data in new_df.groupby(level=1):
+            bytes = data.loc[(account, tier), 'bytes']
+            data_tier_used_space.labels(**{'country': country, 'rse': rse['rse'], 'rse_type': 'rse_type',
+                                           'data_tier': tier, 'account': account}).set(bytes)
+            print(country, rse['rse'], rse_type, tier, account, bytes)
+
 if __name__ == '__main__':
     try:
         registry = CollectorRegistry()
         data_tier_used_space = Gauge('judge_data_tier_used_space',
                                  '', labelnames=('country', 'rse', 'rse_type', 'data_tier', 'account'), registry=registry)
         session = get_session()
+        pool = mp.Pool(mp.cpu_count())
         for rse in list_rses():
-            sources = get_rse_usage(rse['id'])
-            attributes = list_rse_attributes(rse['id'])
-            country = attributes.get('country', 'UNKNOWN')
-            rse_type = session.query(models.RSE.rse_type).filter(models.RSE.id == rse['id']).scalar()
-            rse_type = str(rse_type).split('.', 1)[1]
-            meta = get_dataset_locks_by_rse_id(rse['id'])
-            df = pd.DataFrame(meta)
-            df["tier"] = df.name.str.split("/", expand=True)[3].str.split("#", expand=True)[0]
-            summ = df.groupby(["account", "tier"]).sum()
-            summ = summ.sort_values("bytes", ascending=False)
-            for account, new_df in summ.groupby(level=0):
-                #print('ACCOUNT: '+ str(account))
-                for tier, data in new_df.groupby(level=1):
-                    #print(tier, account)
-                    bytes = data.loc[(account, tier), 'bytes']
-                    data_tier_used_space.labels(**{'country': country, 'rse': rse['rse'], 'rse_type': 'rse_type',
-                                                   'data_tier': tier, 'account': account}).set(bytes)
-                    print(country, rse['rse'], rse_type, tier, account, bytes)
+            pool.apply_async(get_data_tiers_usage, args=(rse,))
+        pool.close()
+        pool.join()
     except:
         print (traceback.format_exc())
         sys.exit(UNKNOWN)
